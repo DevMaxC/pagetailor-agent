@@ -1,24 +1,27 @@
 #!/usr/bin/env node
 
 /**
- * PageTailor agent — powered by the Claude Agent SDK.
+ * PageTailor agent.
  *
- * Runs inside a Vercel Sandbox microVM or standalone. All inputs arrive
+ * Runs standalone or inside a Vercel Sandbox microVM. All inputs arrive
  * as environment variables. Results are posted back to RESULT_URL.
  *
- * The agent uses Claude's agentic loop with WebSearch and WebFetch tools
- * for research, and structured JSON output for both pipelines.
+ * Two execution modes:
+ *   - SDK mode (standalone): uses the Claude Agent SDK with agentic
+ *     tool loops, WebSearch/WebFetch, and structured output.
+ *     Requires: npm install @anthropic-ai/claude-agent-sdk
+ *   - Fetch mode (sandbox): direct HTTP calls to Anthropic's Messages
+ *     API. No external dependencies. Used when the SDK is not installed.
  *
  * Anthropic access:
- *   - Set ANTHROPIC_API_KEY (the SDK reads it automatically)
- *   - For proxied mode (hosted PageTailor), set ANTHROPIC_BASE_URL
+ *   - Set ANTHROPIC_API_KEY for direct access (SDK reads it automatically)
+ *   - Set ANTHROPIC_BASE_URL for proxied access (fetch mode only)
  *
  * See README.md for the full environment variable reference.
  */
 
 import process from "node:process";
 import { readFileSync } from "node:fs";
-import { query } from "@anthropic-ai/claude-agent-sdk";
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -71,6 +74,21 @@ if (!ANTHROPIC_API_KEY && !ANTHROPIC_BASE_URL) {
 }
 
 // ---------------------------------------------------------------------------
+// Detect SDK availability
+// ---------------------------------------------------------------------------
+
+let sdkQuery = null;
+try {
+  const sdk = await import("@anthropic-ai/claude-agent-sdk");
+  sdkQuery = sdk.query;
+  console.log("[agent] Claude Agent SDK detected — using agentic mode");
+} catch {
+  console.log("[agent] Claude Agent SDK not available — using fetch mode");
+}
+
+const USE_SDK = sdkQuery !== null;
+
+// ---------------------------------------------------------------------------
 // Callback
 // ---------------------------------------------------------------------------
 
@@ -91,7 +109,7 @@ async function postCallback(body) {
 }
 
 // ---------------------------------------------------------------------------
-// Exa pre-research (optional, cheaper than agentic web search)
+// Exa pre-research (optional, used by both modes)
 // ---------------------------------------------------------------------------
 
 async function buildExaResearchPacket(companyName, domain) {
@@ -111,9 +129,7 @@ async function buildExaResearchPacket(companyName, domain) {
         method: "POST",
         headers: { "x-api-key": EXA_API_KEY, "Content-Type": "application/json" },
         body: JSON.stringify({
-          query: q,
-          type: "auto",
-          numResults: 6,
+          query: q, type: "auto", numResults: 6,
           contents: { text: { maxCharacters: 1800 } },
         }),
       });
@@ -138,125 +154,145 @@ async function buildExaResearchPacket(companyName, domain) {
   for (const [i, item] of items.entries()) {
     lines.push(`${i + 1}. ${item.title}\n   URL: ${item.url}\n   Notes: ${item.snippet}`);
   }
-
   return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
-// JSON schemas for structured output
+// Fetch-mode Anthropic calls (sandbox / no SDK)
+// ---------------------------------------------------------------------------
+
+function getAnthropicUrl() {
+  const base = ANTHROPIC_BASE_URL || "https://api.anthropic.com";
+  return new URL("v1/messages", `${base}/`).toString();
+}
+
+function getAnthropicHeaders() {
+  if (!ANTHROPIC_BASE_URL && ANTHROPIC_API_KEY) {
+    return { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json" };
+  }
+  return { "Authorization": `Bearer ${RESULT_API_KEY}`, "anthropic-version": "2023-06-01", "Content-Type": "application/json" };
+}
+
+async function callAnthropicFetch(system, userMessage, maxTokens = 4096) {
+  const url = getAnthropicUrl();
+  console.log(`[agent] calling anthropic at ${url} (model: ${MODEL})`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90_000);
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: getAnthropicHeaders(),
+      body: JSON.stringify({
+        model: MODEL, max_tokens: maxTokens, system,
+        messages: [{ role: "user", content: userMessage }],
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Anthropic error (${res.status}): ${text}`);
+    }
+    const data = await res.json();
+    console.log(`[agent] anthropic responded, model: ${data.model}`);
+    return data.content?.find((b) => b.type === "text")?.text ?? "";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// JSON schemas for structured output (SDK mode)
 // ---------------------------------------------------------------------------
 
 const RESEARCH_SCHEMA = {
   type: "object",
   properties: {
-    summary: { type: "string", description: "2-4 paragraph company research dossier" },
-    keyFacts: { type: "array", items: { type: "string" }, description: "Key facts about the company" },
-    painPoints: { type: "array", items: { type: "string" }, description: "Likely pain points and challenges" },
-    techStack: { type: "array", items: { type: "string" }, description: "Known or inferred technology stack" },
+    summary: { type: "string" },
+    keyFacts: { type: "array", items: { type: "string" } },
+    painPoints: { type: "array", items: { type: "string" } },
+    techStack: { type: "array", items: { type: "string" } },
   },
   required: ["summary", "keyFacts", "painPoints", "techStack"],
   additionalProperties: false,
 };
 
-const GENERATION_SCHEMA = {
-  type: "object",
-  additionalProperties: { type: "string" },
-  description: "Landing page content fields, all string values",
-};
-
 // ---------------------------------------------------------------------------
-// Research pipeline (agentic)
+// Research pipeline
 // ---------------------------------------------------------------------------
 
-async function runResearch() {
+async function runResearchSdk() {
   const goal = GOAL ?? "General company research";
   const notes = COMPANY_NOTES ?? "";
   const context = COMPANY_CONTEXT ? JSON.parse(COMPANY_CONTEXT) : {};
 
-  console.log(`[agent] researching ${COMPANY_NAME} (${COMPANY_DOMAIN})`);
-
   const exaPacket = await buildExaResearchPacket(COMPANY_NAME, COMPANY_DOMAIN);
-  if (exaPacket) {
-    console.log("[agent] exa pre-research packet built");
-  }
+  if (exaPacket) console.log("[agent] exa pre-research packet built");
 
   const promptParts = [
     `You are a B2B company research analyst. Produce a concise, factual research dossier about ${COMPANY_NAME} (${COMPANY_DOMAIN}).`,
     `\nResearch goal: ${goal}`,
   ];
-
   if (notes) promptParts.push(`\nAccount notes: ${notes}`);
   if (Object.keys(context).length > 0) promptParts.push(`\nAccount context: ${JSON.stringify(context)}`);
 
   if (exaPacket) {
-    promptParts.push(`\nPre-gathered web sources (use as primary evidence, but you may search for more if needed):\n${exaPacket}`);
+    promptParts.push(`\nPre-gathered web sources:\n${exaPacket}`);
   } else {
-    promptParts.push("\nNo pre-gathered sources. Use WebSearch and WebFetch to find information about this company from their website, docs, help center, and other public sources. Be thorough — check multiple pages.");
+    promptParts.push("\nUse WebSearch and WebFetch to find information about this company. Be thorough.");
   }
-
-  promptParts.push("\nProduce a structured dossier with: summary (2-4 paragraphs), keyFacts, painPoints, and techStack. Cite specific facts from real sources.");
+  promptParts.push("\nProduce a structured dossier with: summary (2-4 paragraphs), keyFacts, painPoints, and techStack.");
 
   const useTools = !exaPacket;
-  const queryOptions = {
-    model: MODEL,
-    maxTurns: MAX_TURNS,
-    effort: EFFORT,
-    persistSession: false,
-    outputFormat: {
-      type: "json_schema",
-      schema: RESEARCH_SCHEMA,
-    },
+  const options = {
+    model: MODEL, maxTurns: MAX_TURNS, effort: EFFORT, persistSession: false,
+    outputFormat: { type: "json_schema", schema: RESEARCH_SCHEMA },
+    tools: useTools ? ["WebSearch", "WebFetch"] : [],
+    allowedTools: useTools ? ["WebSearch", "WebFetch"] : [],
   };
-
-  if (useTools) {
-    queryOptions.tools = ["WebSearch", "WebFetch"];
-    queryOptions.allowedTools = ["WebSearch", "WebFetch"];
-  } else {
-    queryOptions.tools = [];
-    queryOptions.allowedTools = [];
-  }
 
   let result = null;
-
-  for await (const message of query({
-    prompt: promptParts.join("\n"),
-    options: queryOptions,
-  })) {
+  for await (const message of sdkQuery({ prompt: promptParts.join("\n"), options })) {
     if (message.type === "assistant") {
-      const toolUses = message.message?.content?.filter((b) => b.type === "tool_use") ?? [];
-      for (const tu of toolUses) {
-        console.log(`  [tool] ${tu.name}`);
+      for (const b of message.message?.content?.filter((b) => b.type === "tool_use") ?? []) {
+        console.log(`  [tool] ${b.name}`);
       }
     }
-
-    if (message.type === "result") {
-      if (message.subtype === "success" && message.structured_output) {
-        result = message.structured_output;
-        console.log(`[agent] research complete (cost: $${(message.total_cost_usd ?? 0).toFixed(4)})`);
-      } else if (message.subtype === "success" && message.result) {
-        try {
-          result = JSON.parse(message.result.replace(/```(?:json)?\s*([\s\S]*?)\s*```/, "$1"));
-        } catch { /* fallback below */ }
+    if (message.type === "result" && message.subtype === "success") {
+      result = message.structured_output ?? null;
+      if (!result && message.result) {
+        try { result = JSON.parse(message.result.replace(/```(?:json)?\s*([\s\S]*?)\s*```/, "$1")); } catch {}
       }
+      console.log(`[agent] research complete (cost: $${(message.total_cost_usd ?? 0).toFixed(4)})`);
     }
   }
+  if (!result?.summary) throw new Error("Agent did not produce valid research output");
+  return { kind: "research_refresh", summary: result.summary, payload: result };
+}
 
-  if (!result || typeof result.summary !== "string") {
-    throw new Error("Agent did not produce valid research output");
-  }
+async function runResearchFetch() {
+  const goal = GOAL ?? "General company research";
+  const notes = COMPANY_NOTES ?? "";
+  const context = COMPANY_CONTEXT ? JSON.parse(COMPANY_CONTEXT) : {};
 
-  return {
-    kind: "research_refresh",
-    summary: result.summary,
-    payload: result,
-  };
+  console.log(`[agent] researching ${COMPANY_NAME} (${COMPANY_DOMAIN})`);
+  const exaPacket = await buildExaResearchPacket(COMPANY_NAME, COMPANY_DOMAIN);
+
+  const system = `You are a B2B company research analyst. Produce a concise, factual research dossier. Return ONLY valid JSON with keys: "summary" (string, 2-4 paragraphs), "keyFacts" (array of strings), "painPoints" (array of strings), "techStack" (array of strings, best guess). Do not include markdown fences.`;
+  const prompt = `Research goal: ${goal}\n\nCompany: ${COMPANY_NAME} (${COMPANY_DOMAIN})\nNotes: ${notes}\nContext: ${JSON.stringify(context)}\n\nWeb sources:\n${exaPacket || "(no web sources found — use your general knowledge)"}`;
+
+  const llmOutput = await callAnthropicFetch(system, prompt);
+  let parsed;
+  try { parsed = JSON.parse(llmOutput); } catch { parsed = { summary: llmOutput, keyFacts: [], painPoints: [], techStack: [] }; }
+
+  return { kind: "research_refresh", summary: parsed.summary ?? llmOutput.slice(0, 1000), payload: parsed };
 }
 
 // ---------------------------------------------------------------------------
-// Artifact generation pipeline (structured output, no tools needed)
+// Generation pipeline
 // ---------------------------------------------------------------------------
 
-async function runGeneration() {
+function loadGenerationContext() {
   const seller = SELLER_PROFILE ? JSON.parse(SELLER_PROFILE)
     : SELLER_PROFILE_FILE ? readJsonFile(SELLER_PROFILE_FILE) : null;
   const fields = CONTRACT_FIELDS ? JSON.parse(CONTRACT_FIELDS)
@@ -273,10 +309,7 @@ async function runGeneration() {
     : '- "hero_title" (string): A personalized headline\n- "hero_subtitle" (string): Supporting copy';
 
   const fieldSchema = { type: "object", properties: {}, required: [], additionalProperties: false };
-  for (const f of fields) {
-    fieldSchema.properties[f.key] = { type: "string" };
-    fieldSchema.required.push(f.key);
-  }
+  for (const f of fields) { fieldSchema.properties[f.key] = { type: "string" }; fieldSchema.required.push(f.key); }
   if (fields.length === 0) {
     fieldSchema.properties = { hero_title: { type: "string" }, hero_subtitle: { type: "string" } };
     fieldSchema.required = ["hero_title", "hero_subtitle"];
@@ -284,63 +317,56 @@ async function runGeneration() {
 
   const prompt = [
     "You are a B2B landing page copywriter. Generate personalized landing page content for a specific prospect company.",
-    "",
-    `SELLER: ${seller.companyName} — ${seller.productSummary}`,
+    "", `SELLER: ${seller.companyName} — ${seller.productSummary}`,
     `Differentiators: ${seller.differentiators.join(", ")}`,
     `Strongest use cases: ${seller.strongestUseCases.join(", ")}`,
     `ICP: ${seller.idealCustomerProfile}`,
-    "",
-    `PROSPECT: ${COMPANY_NAME} (${COMPANY_DOMAIN})`,
+    "", `PROSPECT: ${COMPANY_NAME} (${COMPANY_DOMAIN})`,
     notes ? `Notes: ${notes}` : null,
     Object.keys(context).length > 0 ? `Context: ${JSON.stringify(context)}` : null,
-    "",
-    `RESEARCH:\n${research?.summary ?? "(no research available — use general knowledge)"}`,
-    "",
-    `INSTRUCTIONS:\n${INSTRUCTIONS ?? "Generate compelling, specific copy that references the prospect by name and connects the seller's value to the prospect's situation."}`,
-    "",
-    `Generate content for these fields (every value must be a string):\n${fieldSpec}`,
+    "", `RESEARCH:\n${research?.summary ?? "(no research available — use general knowledge)"}`,
+    "", `INSTRUCTIONS:\n${INSTRUCTIONS ?? "Generate compelling, specific copy that references the prospect by name and connects the seller's value to the prospect's situation."}`,
+    "", `Generate content for these fields (every value must be a string):\n${fieldSpec}`,
   ].filter(Boolean).join("\n");
 
-  console.log("[agent] generating artifact...");
+  return { prompt, fieldSpec, fieldSchema, seller };
+}
+
+async function runGenerationSdk() {
+  const { prompt, fieldSchema } = loadGenerationContext();
+  console.log("[agent] generating artifact (SDK)...");
 
   let content = null;
-
-  for await (const message of query({
+  for await (const message of sdkQuery({
     prompt,
     options: {
-      model: MODEL,
-      maxTurns: 1,
-      effort: EFFORT,
-      persistSession: false,
-      tools: [],
-      allowedTools: [],
-      outputFormat: {
-        type: "json_schema",
-        schema: fieldSchema,
-      },
+      model: MODEL, maxTurns: 1, effort: EFFORT, persistSession: false,
+      tools: [], allowedTools: [],
+      outputFormat: { type: "json_schema", schema: fieldSchema },
     },
   })) {
-    if (message.type === "result") {
-      if (message.subtype === "success" && message.structured_output) {
-        content = message.structured_output;
-        console.log(`[agent] generation complete (cost: $${(message.total_cost_usd ?? 0).toFixed(4)})`);
-      } else if (message.subtype === "success" && message.result) {
-        try {
-          content = JSON.parse(message.result.replace(/```(?:json)?\s*([\s\S]*?)\s*```/, "$1"));
-        } catch { /* fallback below */ }
+    if (message.type === "result" && message.subtype === "success") {
+      content = message.structured_output ?? null;
+      if (!content && message.result) {
+        try { content = JSON.parse(message.result.replace(/```(?:json)?\s*([\s\S]*?)\s*```/, "$1")); } catch {}
       }
+      console.log(`[agent] generation complete (cost: $${(message.total_cost_usd ?? 0).toFixed(4)})`);
     }
   }
+  if (!content) throw new Error("Agent did not produce valid generation output");
+  return { kind: "artifact_generation", artifactType: ARTIFACT_TYPE ?? "landing_page", content };
+}
 
-  if (!content) {
-    throw new Error("Agent did not produce valid generation output");
-  }
+async function runGenerationFetch() {
+  const { prompt, fieldSpec } = loadGenerationContext();
+  console.log("[agent] generating artifact (fetch)...");
 
-  return {
-    kind: "artifact_generation",
-    artifactType: ARTIFACT_TYPE ?? "landing_page",
-    content,
-  };
+  const system = `You are a B2B landing page copywriter. Generate personalized landing page content for a specific prospect company. Return ONLY valid JSON with the requested field keys. No markdown fences. Every value must be a string.`;
+  const llmOutput = await callAnthropicFetch(system, prompt);
+
+  let content;
+  try { content = JSON.parse(llmOutput); } catch { content = { hero_title: llmOutput.slice(0, 120), hero_subtitle: llmOutput.slice(0, 240) }; }
+  return { kind: "artifact_generation", artifactType: ARTIFACT_TYPE ?? "landing_page", content };
 }
 
 // ---------------------------------------------------------------------------
@@ -349,15 +375,15 @@ async function runGeneration() {
 
 async function main() {
   const kind = RUN_KIND ?? (GOAL ? "research_refresh" : "artifact_generation");
-  console.log(`[agent] starting ${kind} for run ${RUN_ID} (model: ${MODEL})`);
+  console.log(`[agent] starting ${kind} for run ${RUN_ID} (model: ${MODEL}, mode: ${USE_SDK ? "sdk" : "fetch"})`);
 
   await postCallback({ status: "running" });
 
   let result;
   if (kind === "research_refresh") {
-    result = await runResearch();
+    result = USE_SDK ? await runResearchSdk() : await runResearchFetch();
   } else {
-    result = await runGeneration();
+    result = USE_SDK ? await runGenerationSdk() : await runGenerationFetch();
   }
 
   console.log("[agent] posting completed result");
@@ -375,8 +401,6 @@ process.on("SIGTERM", () => {
 main().catch(async (error) => {
   const msg = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
   console.error("[agent] fatal:", msg);
-  try {
-    await postCallback({ status: "failed", error: msg });
-  } catch {}
+  try { await postCallback({ status: "failed", error: msg }); } catch {}
   process.exit(1);
 });

@@ -11,10 +11,15 @@ A standalone Node.js agent that researches a company and generates personalized 
 
 This agent takes a target company, researches it using web sources, and produces structured landing page content tailored to that company. It's built on the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) and runs two pipelines:
 
-1. **Research** -- uses Claude's agentic loop with `WebSearch` and `WebFetch` tools to autonomously find and read company pages, docs, and help centers, then synthesizes a structured dossier. Optionally pre-seeds with [Exa](https://exa.ai) results for faster, cheaper research.
-2. **Generation** -- takes seller context, research, and a field contract, then generates personalized copy using Claude's structured JSON output. No tools needed -- pure generation.
+1. **Research** -- gathers evidence about the target company and synthesizes a structured dossier. Optionally pre-seeds with [Exa](https://exa.ai) for cheaper research.
+2. **Generation** -- takes seller context, research, and a field contract, then generates personalized copy as structured JSON.
 
-All inputs arrive as environment variables. Results are posted to a callback URL as structured JSON validated by JSON Schema.
+The agent runs in two modes depending on what's installed:
+
+- **SDK mode** (when `@anthropic-ai/claude-agent-sdk` is installed): uses Claude's agentic loop with `WebSearch` and `WebFetch` tools for autonomous research, plus JSON Schema structured output.
+- **Fetch mode** (zero dependencies): direct HTTP calls to the Anthropic Messages API. Used automatically inside Vercel Sandbox VMs or any environment without the SDK.
+
+All inputs arrive as environment variables. Results are posted to a callback URL as structured JSON.
 
 ## Requirements
 
