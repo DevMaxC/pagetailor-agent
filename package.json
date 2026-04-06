@@ -5,6 +5,9 @@
   "type": "module",
   "main": "agent.mjs",
   "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.92"
+  },
   "engines": {
     "node": ">=22.0.0"
   },

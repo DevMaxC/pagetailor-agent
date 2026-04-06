@@ -9,22 +9,24 @@ A standalone Node.js agent that researches a company and generates personalized 
 
 ## What it does
 
-This agent takes a target company, researches it using web sources, and produces structured landing page content tailored to that company. It runs two pipelines:
+This agent takes a target company, researches it using web sources, and produces structured landing page content tailored to that company. It's built on the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) and runs two pipelines:
 
-1. **Research** -- searches the web via [Exa](https://exa.ai), then synthesizes a company dossier with Claude.
-2. **Generation** -- takes seller context, research, and a field contract, then generates personalized copy with Claude.
+1. **Research** -- uses Claude's agentic loop with `WebSearch` and `WebFetch` tools to autonomously find and read company pages, docs, and help centers, then synthesizes a structured dossier. Optionally pre-seeds with [Exa](https://exa.ai) results for faster, cheaper research.
+2. **Generation** -- takes seller context, research, and a field contract, then generates personalized copy using Claude's structured JSON output. No tools needed -- pure generation.
 
-All inputs arrive as environment variables. Results are posted to a callback URL as structured JSON.
+All inputs arrive as environment variables. Results are posted to a callback URL as structured JSON validated by JSON Schema.
 
 ## Requirements
 
-- Node.js 22+ (uses native `fetch`)
+- Node.js 22+
 - An [Anthropic API key](https://console.anthropic.com/) for Claude access
-- Optionally, an [Exa API key](https://exa.ai) for web research (without it, research falls back to Claude's general knowledge)
+- Optionally, an [Exa API key](https://exa.ai) for pre-seeded research (without it, the agent uses `WebSearch`/`WebFetch` tools exclusively)
 
 ## Quickstart
 
 ```bash
+npm install
+
 # Research a company
 RUN_ID="run_001" \
 WORKSPACE_ID="ws_local" \
@@ -41,8 +43,8 @@ node agent.mjs
 
 The agent will:
 1. POST `{ "status": "running" }` to your callback URL
-2. Search Exa for company information
-3. Synthesize a research dossier with Claude
+2. Use Claude's agentic loop to search the web, read company pages, and gather evidence
+3. Synthesize a structured research dossier using JSON Schema output
 4. POST `{ "status": "completed", "result": { ... } }` to your callback URL
 
 ## Environment variables
@@ -64,12 +66,14 @@ Set **one** of these:
 
 | Variable | Description |
 |---|---|
-| `ANTHROPIC_API_KEY` | Direct Anthropic API key (standalone mode) |
-| `ANTHROPIC_BASE_URL` | Base URL for a proxied Anthropic endpoint (hosted mode) |
+| `ANTHROPIC_API_KEY` | Anthropic API key (read automatically by the Claude Agent SDK) |
+| `ANTHROPIC_BASE_URL` | Base URL override for a proxied Anthropic endpoint (hosted mode) |
 
 | Variable | Default | Description |
 |---|---|---|
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Model to use for all LLM calls |
+| `AGENT_MAX_TURNS` | `18` | Maximum agentic turns (tool-use round trips) for research |
+| `AGENT_EFFORT` | `medium` | Agent effort level: `low`, `medium`, `high`, or `max` |
 
 ### Run configuration
 
@@ -184,11 +188,11 @@ Sent immediately when the agent starts work.
                     └────────────────────┘
 ```
 
-**Research pipeline**: queries Exa for web sources about the target company, then asks Claude to synthesize a structured dossier with summary, key facts, pain points, and tech stack.
+**Research pipeline**: optionally pre-seeds with Exa results, then uses the Claude Agent SDK's agentic loop with `WebSearch` and `WebFetch` tools. Claude autonomously decides what to search, which pages to read, and when it has enough evidence. Output is validated against a JSON Schema for structured, reliable results.
 
-**Generation pipeline**: loads seller profile, prior research, and field contract definitions. Asks Claude to produce personalized landing page copy as a JSON object matching the field contract.
+**Generation pipeline**: loads seller profile, prior research, and field contract definitions. Uses the Claude Agent SDK with structured JSON output (no tools) to produce personalized copy matching the exact field contract.
 
-Both pipelines post their results to `RESULT_URL` using the callback contract described above.
+Both pipelines post their results to `RESULT_URL` using the callback contract described above. Cost tracking is available via the SDK's `total_cost_usd` field on result messages.
 
 ## Using with PageTailor hosted
 
