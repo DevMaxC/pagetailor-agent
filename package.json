@@ -1,0 +1,26 @@
+{
+  "name": "@pagetailor/agent",
+  "version": "0.1.0",
+  "description": "Standalone agent that researches companies and generates personalized B2B landing page content using Claude and Exa.",
+  "type": "module",
+  "main": "agent.mjs",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pagetailor/agent.git"
+  },
+  "homepage": "https://pagetailor.dev",
+  "keywords": [
+    "pagetailor",
+    "landing-page",
+    "personalization",
+    "b2b",
+    "anthropic",
+    "claude",
+    "exa",
+    "agent"
+  ]
+}
