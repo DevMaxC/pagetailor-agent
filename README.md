@@ -14,12 +14,7 @@ This agent takes a target company, researches it using web sources, and produces
 1. **Research** -- gathers evidence about the target company and synthesizes a structured dossier. Optionally pre-seeds with [Exa](https://exa.ai) for cheaper research.
 2. **Generation** -- takes seller context, research, and a field contract, then generates personalized copy as structured JSON.
 
-The agent runs in two modes depending on what's installed:
-
-- **SDK mode** (when `@anthropic-ai/claude-agent-sdk` is installed): uses Claude's agentic loop with `WebSearch` and `WebFetch` tools for autonomous research, plus JSON Schema structured output.
-- **Fetch mode** (zero dependencies): direct HTTP calls to the Anthropic Messages API. Used automatically inside Vercel Sandbox VMs or any environment without the SDK.
-
-All inputs arrive as environment variables. Results are posted to a callback URL as structured JSON.
+All inputs arrive as environment variables. Results are posted to a callback URL as structured JSON validated by JSON Schema.
 
 ## Requirements
 
@@ -72,7 +67,6 @@ Set **one** of these:
 | Variable | Description |
 |---|---|
 | `ANTHROPIC_API_KEY` | Anthropic API key (read automatically by the Claude Agent SDK) |
-| `ANTHROPIC_BASE_URL` | Base URL override for a proxied Anthropic endpoint (hosted mode) |
 
 | Variable | Default | Description |
 |---|---|---|
